@@ -1,0 +1,20 @@
+name: Deploy new release
+on:
+  push:
+    tags:
+      - "**"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  push_to_crates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Publish to crates.io
+        run: cargo publish -p jsonwebtoken-jwks-cache
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}

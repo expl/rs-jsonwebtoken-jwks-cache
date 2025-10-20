@@ -1,5 +1,5 @@
-# rs-jsonwebtoken-jwks-cache
-Resilient async JWK Set cache
+# jsonwebtoken-jwks-cache
+Resilient and blazingly fast async JWK Set cache
 
 ## Example
 
