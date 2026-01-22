@@ -1,4 +1,5 @@
 mod cache;
+mod pem_set;
 
 pub use cache::TimeoutSpec;
 pub use jsonwebtoken;
