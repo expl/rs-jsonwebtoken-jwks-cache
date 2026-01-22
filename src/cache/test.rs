@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 const JWKS_SAMPLE: &str = include_str!("../../jwks-sample.json");
 
 #[tokio::test]
-async fn test_reqwest_integration() {
+async fn test_reqwest_gcp_jwk_integration() {
     let cache = CachedJWKS::new(
         "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
             .parse()
@@ -19,6 +19,22 @@ async fn test_reqwest_integration() {
     let jwks = cache.get().await.unwrap();
 
     assert_eq!(jwks.keys.len(), 2);
+}
+
+#[tokio::test]
+async fn test_reqwest_gcp_pub_keys_integration() {
+    let cache = CachedJWKS::new_rsa_pkeys(
+        "https://www.googleapis.com/identitytoolkit/v3/relyingparty/publicKeys"
+            .parse()
+            .unwrap(),
+        Duration::from_secs(60 * 60),
+        TimeoutSpec::default(),
+    )
+    .unwrap();
+
+    let jwks = cache.get().await.unwrap();
+
+    assert_eq!(jwks.keys.len(), 5);
 }
 
 #[derive(Clone)]
@@ -46,6 +62,7 @@ impl JwksSource for JwksSourceMock {
     async fn get_jwks(
         self,
         _url: url::Url,
+        _as_pkeys: bool,
         now: SystemTime,
     ) -> Result<(JwkSet, SystemTime), Self::Error> {
         {
@@ -64,6 +81,7 @@ async fn test_fetch_concurrent_from_empty() {
     let source = JwksSourceMock::new(Duration::from_secs(60 * 60), Duration::ZERO);
     let cache = CachedJWKS::from_source(
         "https://example.com".parse().unwrap(),
+        false,
         Duration::from_secs(60),
         Default::default(),
         source.clone(),
@@ -101,6 +119,7 @@ async fn test_background_refresh_and_expire() {
     let source = JwksSourceMock::new(Duration::from_millis(20), Duration::ZERO);
     let cache = CachedJWKS::from_source(
         "https://example.com".parse().unwrap(),
+        false,
         Duration::from_millis(10),
         TimeoutSpec {
             retries: 0,
@@ -141,6 +160,7 @@ async fn test_timeout_policy() {
     let source = JwksSourceMock::new(Duration::from_millis(300), Duration::from_millis(100));
     let cache = CachedJWKS::from_source(
         "https://example.com".parse().unwrap(),
+        false,
         Duration::from_millis(200),
         TimeoutSpec {
             retries: 3,

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test;
 
+use super::pem_set::PemMap;
 use core::future::Future;
 use jsonwebtoken::jwk::JwkSet;
 use spin::RwLock;
@@ -19,6 +20,7 @@ pub trait JwksSource: Clone + Send + Sync + 'static {
     fn get_jwks_within_deadline(
         self,
         url: Url,
+        as_pkeys: bool,
         now: SystemTime,
         deadline: Duration,
     ) -> impl Future<Output = Result<(JwkSet, SystemTime), RequestError<Self::Error>>>
@@ -26,7 +28,7 @@ pub trait JwksSource: Clone + Send + Sync + 'static {
     + Sync
     + 'static {
         async move {
-            let result = tokio::time::timeout(deadline, self.get_jwks(url, now)).await;
+            let result = tokio::time::timeout(deadline, self.get_jwks(url, as_pkeys, now)).await;
 
             match result {
                 Ok(res) => res.map_err(RequestError::Client),
@@ -38,6 +40,7 @@ pub trait JwksSource: Clone + Send + Sync + 'static {
     fn get_jwks(
         self,
         url: Url,
+        as_pkeys: bool,
         now: SystemTime,
     ) -> impl Future<Output = Result<(JwkSet, SystemTime), Self::Error>> + Send + Sync + 'static;
 }
@@ -48,6 +51,7 @@ impl JwksSource for reqwest::Client {
     async fn get_jwks(
         self,
         url: Url,
+        as_pkeys: bool,
         now: SystemTime,
     ) -> Result<(JwkSet, SystemTime), Self::Error> {
         let req = reqwest::Request::new(http::Method::GET, url.clone());
@@ -61,7 +65,11 @@ impl JwksSource for reqwest::Client {
             .error_for_status()?;
 
         let expiration = get_expiration(now, &req, &res);
-        let jwks: JwkSet = res.json().await?;
+        let jwks = if as_pkeys {
+            res.json::<PemMap>().await?.into_rsa_jwk_set()
+        } else {
+            res.json::<JwkSet>().await?
+        };
 
         Ok((jwks, expiration))
     }
@@ -122,6 +130,7 @@ impl Default for TimeoutSpec {
 #[derive(Clone)]
 pub struct CachedJWKS<S> {
     jwks_url: Url,
+    pkeys: bool,
     update_period: Duration,
     timeout_spec: TimeoutSpec,
     cache_state: Arc<RwLock<JWKSCache>>,
@@ -137,6 +146,23 @@ impl CachedJWKS<reqwest::Client> {
     ) -> Result<Self, reqwest::Error> {
         Ok(Self::from_source(
             jwks_url,
+            false,
+            update_period,
+            timeout_spec,
+            reqwest::Client::builder().build()?,
+        ))
+    }
+
+    /// Load keys as a map of RSA pub keys
+    pub fn new_rsa_pkeys(
+        pkeys_url: Url,
+        // Period when to refresh in the background before expiration period
+        update_period: Duration,
+        timeout_spec: TimeoutSpec,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self::from_source(
+            pkeys_url,
+            true,
             update_period,
             timeout_spec,
             reqwest::Client::builder().build()?,
@@ -147,6 +173,7 @@ impl CachedJWKS<reqwest::Client> {
 impl<S: JwksSource> CachedJWKS<S> {
     pub fn from_source(
         jwks_url: Url,
+        pkeys: bool,
         update_period: Duration,
         timeout_spec: TimeoutSpec,
         source: S,
@@ -158,6 +185,7 @@ impl<S: JwksSource> CachedJWKS<S> {
 
         Self {
             jwks_url,
+            pkeys,
             update_period,
             timeout_spec,
             cache_state: Default::default(),
@@ -168,6 +196,7 @@ impl<S: JwksSource> CachedJWKS<S> {
     async fn request(
         source: S,
         url: Url,
+        as_pkeys: bool,
         now: SystemTime,
         timeout: TimeoutSpec,
     ) -> Result<(JwkSet, SystemTime), RequestError<S::Error>> {
@@ -176,7 +205,7 @@ impl<S: JwksSource> CachedJWKS<S> {
             loop {
                 match source
                     .clone()
-                    .get_jwks_within_deadline(url.clone(), now, timeout.retry_after)
+                    .get_jwks_within_deadline(url.clone(), as_pkeys, now, timeout.retry_after)
                     .await
                 {
                     Ok(res) => return Ok(res),
@@ -215,6 +244,7 @@ impl<S: JwksSource> CachedJWKS<S> {
         let result = Self::request(
             self.source.clone(),
             self.jwks_url.clone(),
+            self.pkeys,
             now,
             self.timeout_spec,
         )
@@ -262,9 +292,10 @@ impl<S: JwksSource> CachedJWKS<S> {
         let jwks_url = self.jwks_url.clone();
         let timeout_spec = self.timeout_spec;
         let source = self.source.clone();
+        let as_pkeys = self.pkeys;
 
         tokio::spawn(async move {
-            let result = Self::request(source, jwks_url, now, timeout_spec).await;
+            let result = Self::request(source, jwks_url, as_pkeys, now, timeout_spec).await;
 
             if let Err(err) = &result {
                 log::error!("Error while refreshing JWKS in the background: {err:?}");
