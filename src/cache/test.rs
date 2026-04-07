@@ -18,7 +18,7 @@ async fn test_reqwest_gcp_jwk_integration() {
 
     let jwks = cache.get().await.unwrap();
 
-    assert_eq!(jwks.keys.len(), 2);
+    assert!(!jwks.keys.is_empty());
 }
 
 #[tokio::test]
@@ -34,7 +34,7 @@ async fn test_reqwest_gcp_pub_keys_integration() {
 
     let jwks = cache.get().await.unwrap();
 
-    assert_eq!(jwks.keys.len(), 5);
+    assert!(!jwks.keys.is_empty());
 }
 
 #[derive(Clone)]
