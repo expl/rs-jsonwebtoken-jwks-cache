@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod test;
 
-use super::pem_set::PemMap;
+use core::fmt;
 use core::future::Future;
+
+use super::pem_set::PemMap;
 use jsonwebtoken::jwk::JwkSet;
 use spin::RwLock;
 use std::sync::Arc;
@@ -15,7 +17,7 @@ fn get_expiration(now: SystemTime, req: &reqwest::Request, res: &reqwest::Respon
 }
 
 pub trait JwksSource: Clone + Send + Sync + 'static {
-    type Error: core::fmt::Debug + Send + Sync + 'static;
+    type Error: fmt::Debug + Send + Sync + 'static;
 
     fn get_jwks_within_deadline(
         self,
@@ -90,15 +92,28 @@ enum JWKSCache {
     Fetched { expires: SystemTime, jwks: JwkSet },
 }
 
+impl JWKSCache {
+    const fn is_refreshing(&self) -> bool {
+        matches!(self, Self::Refreshing { .. })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub enum RequestError<E: core::fmt::Debug> {
+pub enum RequestError<E: fmt::Debug> {
     #[error("Client error: {0}")]
     Client(E),
     #[error("Timeout for request completion reached")]
     Timeout,
 }
 
-impl<T: core::fmt::Debug> From<T> for RequestError<T> {
+impl<E: fmt::Debug> RequestError<E> {
+    ///Returns `true` if request timed out.
+    pub const fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout)
+    }
+}
+
+impl<T: fmt::Debug> From<T> for RequestError<T> {
     fn from(value: T) -> Self {
         Self::Client(value)
     }
@@ -281,6 +296,12 @@ impl<S: JwksSource> CachedJWKS<S> {
     fn update_in_background(&self, now: SystemTime, old_jwks: JwkSet, old_expires: SystemTime) {
         {
             let mut cache_state = self.cache_state.write();
+
+            //Because concurrent readers of the state can acquire Fetched at the same time, we need
+            //to guard against multiple refresh attempts
+            if cache_state.is_refreshing() {
+                return;
+            }
 
             *cache_state = JWKSCache::Refreshing {
                 expires: old_expires,
