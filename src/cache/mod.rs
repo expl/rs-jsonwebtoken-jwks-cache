@@ -316,44 +316,59 @@ impl<S: JwksSource> CachedJWKS<S> {
         let as_pkeys = self.pkeys;
 
         tokio::spawn(async move {
-            let result = Self::request(source, jwks_url, as_pkeys, now, timeout_spec).await;
+            loop {
+                let result = Self::request(
+                    source.clone(),
+                    jwks_url.clone(),
+                    as_pkeys,
+                    now,
+                    timeout_spec,
+                )
+                .await;
 
-            if let Err(err) = &result {
-                log::error!("Error while refreshing JWKS in the background: {err:?}");
+                if let Err(err) = &result {
+                    log::error!("Error while refreshing JWKS in the background: {err:?}");
+                }
+
+                let mut cache_state = cache_state.write();
+
+                let new_state = match cache_state.to_owned() {
+                    JWKSCache::Empty => match result {
+                        Ok((jwks, expires)) => JWKSCache::Fetched { expires, jwks },
+                        Err(_) => JWKSCache::Empty,
+                    },
+                    JWKSCache::Fetching(notify) => {
+                        if let Ok((jwks, expires)) = result {
+                            notify.notify_waiters();
+                            JWKSCache::Fetched { expires, jwks }
+                        } else {
+                            JWKSCache::Fetching(notify)
+                        }
+                    }
+                    JWKSCache::Refreshing { expires, .. } => {
+                        if let Ok((jwks, expires)) = result {
+                            JWKSCache::Fetched { expires, jwks }
+                        } else if SystemTime::now() >= expires {
+                            //Pending JWKs are already expired, invalidate it
+                            JWKSCache::Empty
+                        } else {
+                            //Attempt to refresh again
+                            continue;
+                        }
+                    }
+                    JWKSCache::Fetched { expires, jwks } => {
+                        if let Ok((jwks, expires)) = result {
+                            JWKSCache::Fetched { expires, jwks }
+                        } else {
+                            //We couldn't refresh successfully, but it is already fetched so don't care (but this branch is impossible anyway)
+                            JWKSCache::Fetched { expires, jwks }
+                        }
+                    }
+                };
+
+                *cache_state = new_state;
+                break;
             }
-
-            let mut cache_state = cache_state.write();
-
-            let new_state = match cache_state.to_owned() {
-                JWKSCache::Empty => match result {
-                    Ok((jwks, expires)) => JWKSCache::Fetched { expires, jwks },
-                    Err(_) => JWKSCache::Empty,
-                },
-                JWKSCache::Fetching(notify) => {
-                    if let Ok((jwks, expires)) = result {
-                        notify.notify_waiters();
-                        JWKSCache::Fetched { expires, jwks }
-                    } else {
-                        JWKSCache::Fetching(notify)
-                    }
-                }
-                JWKSCache::Refreshing { expires, jwks } => {
-                    if let Ok((jwks, expires)) = result {
-                        JWKSCache::Fetched { expires, jwks }
-                    } else {
-                        JWKSCache::Refreshing { expires, jwks }
-                    }
-                }
-                JWKSCache::Fetched { expires, jwks } => {
-                    if let Ok((jwks, expires)) = result {
-                        JWKSCache::Fetched { expires, jwks }
-                    } else {
-                        JWKSCache::Refreshing { expires, jwks }
-                    }
-                }
-            };
-
-            *cache_state = new_state;
         });
     }
 
