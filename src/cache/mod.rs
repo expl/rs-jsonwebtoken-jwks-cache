@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod test;
 
-use super::pem_set::PemMap;
+use core::fmt;
 use core::future::Future;
+
+use super::pem_set::PemMap;
 use jsonwebtoken::jwk::JwkSet;
 use spin::RwLock;
 use std::sync::Arc;
@@ -10,12 +12,35 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use url::Url;
 
+struct CacheResetGuard {
+    cache_state: Arc<RwLock<JWKSCache>>,
+    notifier: Option<Arc<Notify>>,
+}
+
+impl CacheResetGuard {
+    pub fn finish_state_update(mut self, result: JWKSCache) {
+        if let Some(notifier) = self.notifier.take() {
+            *self.cache_state.write() = result;
+            notifier.notify_waiters();
+        }
+    }
+}
+
+impl Drop for CacheResetGuard {
+    fn drop(&mut self) {
+        if let Some(notifier) = self.notifier.take() {
+            *self.cache_state.write() = JWKSCache::Empty;
+            notifier.notify_waiters();
+        }
+    }
+}
+
 fn get_expiration(now: SystemTime, req: &reqwest::Request, res: &reqwest::Response) -> SystemTime {
     now + http_cache_semantics::CachePolicy::new(req, res).time_to_live(now)
 }
 
 pub trait JwksSource: Clone + Send + Sync + 'static {
-    type Error: core::fmt::Debug + Send + Sync + 'static;
+    type Error: fmt::Debug + Send + Sync + 'static;
 
     fn get_jwks_within_deadline(
         self,
@@ -90,15 +115,28 @@ enum JWKSCache {
     Fetched { expires: SystemTime, jwks: JwkSet },
 }
 
+impl JWKSCache {
+    const fn is_refreshing(&self) -> bool {
+        matches!(self, Self::Refreshing { .. })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub enum RequestError<E: core::fmt::Debug> {
+pub enum RequestError<E: fmt::Debug> {
     #[error("Client error: {0}")]
     Client(E),
     #[error("Timeout for request completion reached")]
     Timeout,
 }
 
-impl<T: core::fmt::Debug> From<T> for RequestError<T> {
+impl<E: fmt::Debug> RequestError<E> {
+    ///Returns `true` if request timed out.
+    pub const fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout)
+    }
+}
+
+impl<T: fmt::Debug> From<T> for RequestError<T> {
     fn from(value: T) -> Self {
         Self::Client(value)
     }
@@ -240,6 +278,10 @@ impl<S: JwksSource> CachedJWKS<S> {
         } else {
             return Ok(None);
         };
+        let guard = CacheResetGuard {
+            cache_state: self.cache_state.clone(),
+            notifier: Some(notifier),
+        };
 
         let result = Self::request(
             self.source.clone(),
@@ -250,30 +292,18 @@ impl<S: JwksSource> CachedJWKS<S> {
         )
         .await;
 
-        let result = {
-            let mut cached_state = self.cache_state.write();
+        match result {
+            Ok((jwks, expires)) => {
+                guard.finish_state_update(JWKSCache::Fetched {
+                    expires,
+                    jwks: jwks.clone(),
+                });
 
-            match result {
-                Ok((jwks, expires)) => {
-                    *cached_state = JWKSCache::Fetched {
-                        expires,
-                        jwks: jwks.clone(),
-                    };
-
-                    Ok(Some(jwks))
-                }
-                // Could not fetch in time, let follow up request try again later
-                Err(err) => {
-                    *cached_state = JWKSCache::Empty;
-
-                    Err(err)
-                }
+                Ok(Some(jwks))
             }
-        };
-
-        notifier.notify_waiters();
-
-        result
+            // Could not fetch in time, let follow up request try again later
+            Err(err) => Err(err),
+        }
     }
 
     /// Trigger refresh of JWKS in the background when cached JWKS is stil valid but about to expire,
@@ -281,6 +311,12 @@ impl<S: JwksSource> CachedJWKS<S> {
     fn update_in_background(&self, now: SystemTime, old_jwks: JwkSet, old_expires: SystemTime) {
         {
             let mut cache_state = self.cache_state.write();
+
+            //Because concurrent readers of the state can acquire Fetched at the same time, we need
+            //to guard against multiple refresh attempts
+            if cache_state.is_refreshing() {
+                return;
+            }
 
             *cache_state = JWKSCache::Refreshing {
                 expires: old_expires,
@@ -295,44 +331,59 @@ impl<S: JwksSource> CachedJWKS<S> {
         let as_pkeys = self.pkeys;
 
         tokio::spawn(async move {
-            let result = Self::request(source, jwks_url, as_pkeys, now, timeout_spec).await;
+            loop {
+                let result = Self::request(
+                    source.clone(),
+                    jwks_url.clone(),
+                    as_pkeys,
+                    now,
+                    timeout_spec,
+                )
+                .await;
 
-            if let Err(err) = &result {
-                log::error!("Error while refreshing JWKS in the background: {err:?}");
+                if let Err(err) = &result {
+                    log::error!("Error while refreshing JWKS in the background: {err:?}");
+                }
+
+                let mut cache_state = cache_state.write();
+
+                let new_state = match cache_state.to_owned() {
+                    JWKSCache::Empty => match result {
+                        Ok((jwks, expires)) => JWKSCache::Fetched { expires, jwks },
+                        Err(_) => JWKSCache::Empty,
+                    },
+                    JWKSCache::Fetching(notify) => {
+                        if let Ok((jwks, expires)) = result {
+                            notify.notify_waiters();
+                            JWKSCache::Fetched { expires, jwks }
+                        } else {
+                            JWKSCache::Fetching(notify)
+                        }
+                    }
+                    JWKSCache::Refreshing { expires, .. } => {
+                        if let Ok((jwks, expires)) = result {
+                            JWKSCache::Fetched { expires, jwks }
+                        } else if SystemTime::now() >= expires {
+                            //Pending JWKs are already expired, invalidate it
+                            JWKSCache::Empty
+                        } else {
+                            //Attempt to refresh again
+                            continue;
+                        }
+                    }
+                    JWKSCache::Fetched { expires, jwks } => {
+                        if let Ok((jwks, expires)) = result {
+                            JWKSCache::Fetched { expires, jwks }
+                        } else {
+                            //We couldn't refresh successfully, but it is already fetched so don't care (but this branch is impossible anyway)
+                            JWKSCache::Fetched { expires, jwks }
+                        }
+                    }
+                };
+
+                *cache_state = new_state;
+                break;
             }
-
-            let mut cache_state = cache_state.write();
-
-            let new_state = match cache_state.to_owned() {
-                JWKSCache::Empty => match result {
-                    Ok((jwks, expires)) => JWKSCache::Fetched { expires, jwks },
-                    Err(_) => JWKSCache::Empty,
-                },
-                JWKSCache::Fetching(notify) => {
-                    if let Ok((jwks, expires)) = result {
-                        notify.notify_waiters();
-                        JWKSCache::Fetched { expires, jwks }
-                    } else {
-                        JWKSCache::Fetching(notify)
-                    }
-                }
-                JWKSCache::Refreshing { expires, jwks } => {
-                    if let Ok((jwks, expires)) = result {
-                        JWKSCache::Fetched { expires, jwks }
-                    } else {
-                        JWKSCache::Refreshing { expires, jwks }
-                    }
-                }
-                JWKSCache::Fetched { expires, jwks } => {
-                    if let Ok((jwks, expires)) = result {
-                        JWKSCache::Fetched { expires, jwks }
-                    } else {
-                        JWKSCache::Refreshing { expires, jwks }
-                    }
-                }
-            };
-
-            *cache_state = new_state;
         });
     }
 

@@ -1,6 +1,6 @@
-use super::{CachedJWKS, JwksSource, RequestError, TimeoutSpec};
+use super::{CachedJWKS, JwksSource, TimeoutSpec};
 use jsonwebtoken::jwk::JwkSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, atomic};
 use std::time::{Duration, SystemTime};
 
 const JWKS_SAMPLE: &str = include_str!("../../jwks-sample.json");
@@ -42,7 +42,7 @@ struct JwksSourceMock {
     jwks: JwkSet,
     expires: Duration,
     take_time: Duration,
-    fetched: Arc<Mutex<usize>>,
+    fetched: Arc<atomic::AtomicUsize>,
 }
 
 impl JwksSourceMock {
@@ -51,8 +51,12 @@ impl JwksSourceMock {
             jwks: serde_json::from_str(JWKS_SAMPLE).unwrap(),
             expires,
             take_time,
-            fetched: Arc::new(Mutex::new(0)),
+            fetched: Arc::new(atomic::AtomicUsize::new(0)),
         }
+    }
+
+    fn fetch_count(&self) -> usize {
+        self.fetched.load(atomic::Ordering::Acquire)
     }
 }
 
@@ -65,11 +69,7 @@ impl JwksSource for JwksSourceMock {
         _as_pkeys: bool,
         now: SystemTime,
     ) -> Result<(JwkSet, SystemTime), Self::Error> {
-        {
-            let mut counter = self.fetched.lock().unwrap();
-            *counter += 1;
-        }
-
+        self.fetched.fetch_add(1, atomic::Ordering::AcqRel);
         tokio::time::sleep(self.take_time).await;
 
         Ok((self.jwks.clone(), now + self.expires))
@@ -108,13 +108,13 @@ async fn test_fetch_concurrent_from_empty() {
     }
 
     assert_eq!(
-        source.fetched.lock().unwrap().clone(),
+        source.fetch_count(),
         1,
         "Should only performed fetch IO once"
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_background_refresh_and_expire() {
     let source = JwksSourceMock::new(Duration::from_millis(20), Duration::ZERO);
     let cache = CachedJWKS::from_source(
@@ -139,23 +139,35 @@ async fn test_background_refresh_and_expire() {
     tokio::time::sleep(Duration::from_millis(1)).await;
 
     assert_eq!(
-        source.fetched.lock().unwrap().clone(),
+        source.fetch_count(),
         2,
         "Should only performed fetch IO in background"
     );
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let request_deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    //Attempt to trigger race in `Fetched` branch
+    //This is not 100% but it is possible in truly parallel code
+    for _ in 0..256 {
+        let cache_clone = cache.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(request_deadline).await;
+            cache_clone.get().await.unwrap();
+        });
+    }
+    tokio::time::sleep_until(request_deadline).await;
     cache.get().await.unwrap();
     cache.get().await.unwrap();
 
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
-        source.fetched.lock().unwrap().clone(),
+        source.fetch_count(),
         3,
-        "Should have refreshed from IO"
+        "Should have refreshed from IO once"
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_timeout_policy() {
     let source = JwksSourceMock::new(Duration::from_millis(300), Duration::from_millis(100));
     let cache = CachedJWKS::from_source(
@@ -171,18 +183,65 @@ async fn test_timeout_policy() {
         source.clone(),
     );
 
-    let _err = cache
-        .get()
-        .await
-        .expect_err("Expected timeout to be reached");
+    let cache_clone = cache.clone();
+    let cache_clone2 = cache.clone();
+    let request1 = tokio::spawn(async move { cache.get().await });
+    let request_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let request2 = tokio::spawn(async move {
+        tokio::time::sleep_until(request_deadline).await;
+        cache_clone.get().await
+    });
+    let request3 = tokio::spawn(async move {
+        tokio::time::sleep_until(request_deadline).await;
+        cache_clone2.get().await
+    });
 
-    assert!(
-        matches!(RequestError::<()>::Timeout, _err),
-        "Expected timeout error"
-    );
+    let error1 = request1
+        .await
+        .expect("spawned future completes")
+        .expect_err("should fail with error");
+    let error2 = request2
+        .await
+        .expect("spawned future completes")
+        .expect_err("should fail with error");
+    let error3 = request3
+        .await
+        .expect("spawned future completes")
+        .expect_err("should fail with error");
+    assert!(error1.is_timeout(), "Expected timeout error");
+    assert!(error2.is_timeout(), "Expected timeout error");
+    assert!(error3.is_timeout(), "Expected timeout error");
     assert_eq!(
-        source.fetched.lock().unwrap().clone(),
-        4, // initial request + 3 retries
-        "Should have retried 3 times"
+        source.fetch_count(),
+        12, // initial request + 3 retries
+        "Should have retried 9 times"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fetch_task_cancellation() {
+    let source = JwksSourceMock::new(Duration::from_millis(300), Duration::from_millis(100));
+    let cache = CachedJWKS::from_source(
+        "https://example.com".parse().unwrap(),
+        false,
+        Duration::from_millis(200),
+        TimeoutSpec {
+            retries: 3,
+            retry_after: Duration::from_millis(10),
+            backoff: Duration::from_millis(1),
+            deadline: Duration::from_millis(50),
+        },
+        source.clone(),
+    );
+
+    let cache_clone = cache.clone();
+    let request1 = tokio::spawn(async move { cache_clone.get().await });
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    request1.abort();
+
+    let error = tokio::time::timeout(tokio::time::Duration::from_secs(1), cache.get())
+        .await
+        .expect("should finish within 1 second")
+        .expect_err("should time out");
+    assert!(error.is_timeout(), "Expected timeout error");
 }
