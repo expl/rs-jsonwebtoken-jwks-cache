@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod test;
 
+use core::fmt;
 use core::future::Future;
-use core::{fmt, mem};
 
 use super::pem_set::PemMap;
 use jsonwebtoken::jwk::JwkSet;
@@ -14,14 +14,24 @@ use url::Url;
 
 struct CacheResetGuard {
     cache_state: Arc<RwLock<JWKSCache>>,
-    notifier: Arc<Notify>,
-    result: JWKSCache,
+    notifier: Option<Arc<Notify>>,
+}
+
+impl CacheResetGuard {
+    pub fn finish_state_update(mut self, result: JWKSCache) {
+        if let Some(notifier) = self.notifier.take() {
+            *self.cache_state.write() = result;
+            notifier.notify_waiters();
+        }
+    }
 }
 
 impl Drop for CacheResetGuard {
     fn drop(&mut self) {
-        *self.cache_state.write() = mem::take(&mut self.result);
-        self.notifier.notify_waiters();
+        if let Some(notifier) = self.notifier.take() {
+            *self.cache_state.write() = JWKSCache::Empty;
+            notifier.notify_waiters();
+        }
     }
 }
 
@@ -268,10 +278,9 @@ impl<S: JwksSource> CachedJWKS<S> {
         } else {
             return Ok(None);
         };
-        let mut guard = CacheResetGuard {
+        let guard = CacheResetGuard {
             cache_state: self.cache_state.clone(),
-            notifier,
-            result: JWKSCache::Empty,
+            notifier: Some(notifier),
         };
 
         let result = Self::request(
@@ -285,10 +294,10 @@ impl<S: JwksSource> CachedJWKS<S> {
 
         match result {
             Ok((jwks, expires)) => {
-                guard.result = JWKSCache::Fetched {
+                guard.finish_state_update(JWKSCache::Fetched {
                     expires,
                     jwks: jwks.clone(),
-                };
+                });
 
                 Ok(Some(jwks))
             }
