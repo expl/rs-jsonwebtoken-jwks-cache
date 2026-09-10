@@ -217,3 +217,31 @@ async fn test_timeout_policy() {
         "Should have retried 9 times"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fetch_task_cancellation() {
+    let source = JwksSourceMock::new(Duration::from_millis(300), Duration::from_millis(100));
+    let cache = CachedJWKS::from_source(
+        "https://example.com".parse().unwrap(),
+        false,
+        Duration::from_millis(200),
+        TimeoutSpec {
+            retries: 3,
+            retry_after: Duration::from_millis(10),
+            backoff: Duration::from_millis(1),
+            deadline: Duration::from_millis(50),
+        },
+        source.clone(),
+    );
+
+    let cache_clone = cache.clone();
+    let request1 = tokio::spawn(async move { cache_clone.get().await });
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    request1.abort();
+
+    let error = tokio::time::timeout(tokio::time::Duration::from_secs(1), cache.get())
+        .await
+        .expect("should finish within 1 second")
+        .expect_err("should time out");
+    assert!(error.is_timeout(), "Expected timeout error");
+}
