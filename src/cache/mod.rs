@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod test;
 
-use core::fmt;
 use core::future::Future;
+use core::{fmt, mem};
 
 use super::pem_set::PemMap;
 use jsonwebtoken::jwk::JwkSet;
@@ -11,6 +11,19 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use url::Url;
+
+struct CacheResetGuard {
+    cache_state: Arc<RwLock<JWKSCache>>,
+    notifier: Arc<Notify>,
+    result: JWKSCache,
+}
+
+impl Drop for CacheResetGuard {
+    fn drop(&mut self) {
+        *self.cache_state.write() = mem::take(&mut self.result);
+        self.notifier.notify_waiters();
+    }
+}
 
 fn get_expiration(now: SystemTime, req: &reqwest::Request, res: &reqwest::Response) -> SystemTime {
     now + http_cache_semantics::CachePolicy::new(req, res).time_to_live(now)
@@ -255,6 +268,11 @@ impl<S: JwksSource> CachedJWKS<S> {
         } else {
             return Ok(None);
         };
+        let mut guard = CacheResetGuard {
+            cache_state: self.cache_state.clone(),
+            notifier,
+            result: JWKSCache::Empty,
+        };
 
         let result = Self::request(
             self.source.clone(),
@@ -265,30 +283,18 @@ impl<S: JwksSource> CachedJWKS<S> {
         )
         .await;
 
-        let result = {
-            let mut cached_state = self.cache_state.write();
+        match result {
+            Ok((jwks, expires)) => {
+                guard.result = JWKSCache::Fetched {
+                    expires,
+                    jwks: jwks.clone(),
+                };
 
-            match result {
-                Ok((jwks, expires)) => {
-                    *cached_state = JWKSCache::Fetched {
-                        expires,
-                        jwks: jwks.clone(),
-                    };
-
-                    Ok(Some(jwks))
-                }
-                // Could not fetch in time, let follow up request try again later
-                Err(err) => {
-                    *cached_state = JWKSCache::Empty;
-
-                    Err(err)
-                }
+                Ok(Some(jwks))
             }
-        };
-
-        notifier.notify_waiters();
-
-        result
+            // Could not fetch in time, let follow up request try again later
+            Err(err) => Err(err),
+        }
     }
 
     /// Trigger refresh of JWKS in the background when cached JWKS is stil valid but about to expire,
